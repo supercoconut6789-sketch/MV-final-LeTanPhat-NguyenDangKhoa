@@ -1,0 +1,750 @@
+
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+from scipy.optimize import linear_sum_assignment
+import csv, os
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+class CFG:
+    COURT_W_M = 6.1
+    COURT_H_M = 13.4
+
+    BG_HISTORY    = 500
+    VAR_THRESHOLD = 16
+    LEARN_RATE    = -1
+
+    MIN_AREA   = 600       # giảm để bắt player xa camera (nhỏ hơn)
+    MAX_AREA   = 60000
+    MIN_ASPECT = 0.8
+    MAX_ASPECT = 6.0
+
+    IOU_THRESH      = 0.10
+    DIST_THRESH_PX  = 160
+    MAX_LOST_FRAMES = 35
+    GRACE_FRAMES    = 35
+    CONFIRM_HITS    = 5
+    MAX_PLAYERS     = 2
+
+    HEATMAP_RES_M  = 20
+    GAUSSIAN_SIGMA = 3
+
+    # FIX-1: ROI margin lớn hơn để không mất player xa
+    ROI_MARGIN_PX    = 200
+    # FIX-2: court margin nhỏ để lọc ketat
+    COURT_FILTER_MARGIN = 0.3   # m — detection foot phải nằm trong sân ± margin này
+    HEATMAP_MARGIN_M = 0.5
+
+    SKIP_FRAMES      = 1
+    MAX_DURATION_SEC = 600
+    OUTPUT_DIR       = "output"
+    DRAW_GRID        = True
+
+    VIDEO_PATH = "Final.mp4"
+
+    # FIX-4: near-net threshold (m) — khi 2 player gần lưới
+    NEAR_NET_Y_DIFF  = 2.0   # nếu |cy0 - cy1| < giá trị này → near-net mode
+    NEAR_NET_DIST_PX = 220   # DIST_THRESH_PX mở rộng khi near-net
+
+
+# ═══════════════════════════════════════════════════════════════
+# CORNER SELECTION
+# ═══════════════════════════════════════════════════════════════
+def load_or_select_corners(video_path, frame_index=30):
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError("Không đọc được frame")
+
+    pts = []
+    print("\n[INFO] Click 4 góc sân: TL → TR → BR → BL, rồi nhấn ENTER\n")
+
+    def click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            pts.append((x, y))
+            print(f"  Góc {len(pts)}: ({x}, {y})")
+
+    labels = ["TL", "TR", "BR", "BL"]
+    cv2.namedWindow("Select Court Corners", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("Select Court Corners", click)
+
+    while True:
+        img = frame.copy()
+        for i, p in enumerate(pts):
+            cv2.circle(img, p, 7, (0, 0, 255), -1)
+            cv2.putText(img, labels[i], (p[0]+8, p[1]-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        for i in range(len(pts) - 1):
+            cv2.line(img, pts[i], pts[i+1], (0, 200, 0), 2)
+        if len(pts) == 4:
+            cv2.line(img, pts[3], pts[0], (0, 200, 0), 2)
+        cv2.imshow("Select Court Corners", img)
+        key = cv2.waitKey(20) & 0xFF
+        if key == 13 and len(pts) == 4:
+            break
+        if key == 27:
+            cv2.destroyAllWindows()
+            raise RuntimeError("Hủy")
+
+    cv2.destroyAllWindows()
+    return np.float32(pts)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PERSPECTIVE TRANSFORMER
+# ═══════════════════════════════════════════════════════════════
+class PerspectiveTransformer:
+    def __init__(self, src_corners: np.ndarray):
+        W, H = CFG.COURT_W_M, CFG.COURT_H_M
+        dst  = np.float32([[0,0],[W,0],[W,H],[0,H]])
+        self.M    = cv2.getPerspectiveTransform(src_corners, dst)
+        self.Minv = cv2.getPerspectiveTransform(dst, src_corners)
+        self._verify(src_corners)
+
+    def _verify(self, src):
+        labels   = ["Top-Left","Top-Right","Bottom-Right","Bottom-Left"]
+        expected = [(0,0),(CFG.COURT_W_M,0),
+                    (CFG.COURT_W_M,CFG.COURT_H_M),(0,CFG.COURT_H_M)]
+        print("\n[DEBUG] Perspective Transform:")
+        ok = 0
+        for i, (px, py) in enumerate(src):
+            cx, cy = self.to_court(px, py)
+            good = abs(cx-expected[i][0]) < 0.1 and abs(cy-expected[i][1]) < 0.1
+            ok += good
+            print(f"  [{'✓' if good else '✗'}] {labels[i]:14s}"
+                  f"  pixel({px:.0f},{py:.0f}) -> court({cx:.3f},{cy:.3f})m")
+        print(f"  {ok}/4 corners OK\n")
+
+    def to_court(self, px, py):
+        r = cv2.perspectiveTransform(
+            np.array([[[float(px), float(py)]]], np.float32), self.M)
+        return float(r[0,0,0]), float(r[0,0,1])
+
+    def to_image(self, cx, cy):
+        r = cv2.perspectiveTransform(
+            np.array([[[float(cx), float(cy)]]], np.float32), self.Minv)
+        return float(r[0,0,0]), float(r[0,0,1])
+
+    def in_court(self, cx, cy, margin=CFG.HEATMAP_MARGIN_M):
+        return (-margin <= cx <= CFG.COURT_W_M + margin and
+                -margin <= cy <= CFG.COURT_H_M + margin)
+
+    def court_dist(self, foot1, foot2):
+        """Khoảng cách Euclidean trong court space (m) giữa 2 foot pixel."""
+        cx1, cy1 = self.to_court(*foot1)
+        cx2, cy2 = self.to_court(*foot2)
+        return float(np.hypot(cx1-cx2, cy1-cy2))
+
+
+# ═══════════════════════════════════════════════════════════════
+# ROI MASK  — FIX-1: margin lớn hơn, dùng lại trong detector
+# ═══════════════════════════════════════════════════════════════
+def build_roi_mask(frame_shape, corners: np.ndarray,
+                   margin: int = CFG.ROI_MARGIN_PX) -> np.ndarray:
+    h, w   = frame_shape[:2]
+    mask   = np.zeros((h, w), np.uint8)
+    center = corners.mean(axis=0)
+    expanded = []
+    for pt in corners:
+        d = pt - center
+        n = np.linalg.norm(d)
+        expanded.append(pt + (d / n * margin if n > 0 else d))
+    cv2.fillPoly(mask, [np.int32(expanded)], 255)
+    return mask
+
+
+# ═══════════════════════════════════════════════════════════════
+# KALMAN TRACK
+# ═══════════════════════════════════════════════════════════════
+class KalmanTrack:
+    _next_id = 0
+
+    def __init__(self, bbox, foot, fps: float):
+        self.id        = KalmanTrack._next_id
+        KalmanTrack._next_id += 1
+        self.lost      = 0
+        self.grace     = 0
+        self.hits      = 1
+        self.last_bbox = bbox
+        self.last_foot = foot
+        self.last_area = bbox[2] * bbox[3]
+
+        dt = 1.0
+        kf = cv2.KalmanFilter(4, 2)
+        kf.transitionMatrix    = np.array([[1,0,dt,0],
+                                           [0,1,0,dt],
+                                           [0,0,1, 0],
+                                           [0,0,0, 1]], np.float32)
+        kf.measurementMatrix   = np.array([[1,0,0,0],
+                                           [0,1,0,0]], np.float32)
+        kf.processNoiseCov     = np.eye(4, dtype=np.float32) * 0.05
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 2.0
+        kf.errorCovPost        = np.eye(4, dtype=np.float32) * 10.0
+
+        x, y, w, h = bbox
+        cx, cy = x + w/2, y + h/2
+        kf.statePost = np.array([[cx],[cy],[0],[0]], np.float32)
+        self.kf = kf
+
+    def update(self, bbox, foot):
+        x, y, w, h = bbox
+        cx, cy = x + w/2, y + h/2
+        self.kf.correct(np.array([[cx],[cy]], np.float32))
+        self.last_bbox = bbox
+        self.last_foot = foot
+        self.last_area = w * h
+        self.lost  = 0
+        self.hits += 1
+        self.grace = 0
+
+    def predict(self):
+        self.kf.predict()
+        self.lost += 1
+
+    @property
+    def predicted_center(self):
+        s = self.kf.statePre
+        return float(s[0,0]), float(s[1,0])
+
+    @property
+    def is_confirmed(self):
+        return self.hits >= CFG.CONFIRM_HITS
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+def _iou(b1, b2) -> float:
+    x1,y1,w1,h1 = b1;  x2,y2,w2,h2 = b2
+    ix = max(0, min(x1+w1, x2+w2) - max(x1, x2))
+    iy = max(0, min(y1+h1, y2+h2) - max(y1, y2))
+    inter = ix * iy
+    union = w1*h1 + w2*h2 - inter
+    return inter / max(union, 1)
+
+
+def _center_dist(track: KalmanTrack, det: dict) -> float:
+    x, y, w, h = det['bbox']
+    dcx, dcy = x + w/2, y + h/2
+    tcx, tcy = track.predicted_center
+    return float(np.hypot(dcx - tcx, dcy - tcy))
+
+
+def _area_sim(track: KalmanTrack, det: dict) -> float:
+    a1 = max(track.last_area, 1)
+    a2 = max(det['area'], 1)
+    return min(a1, a2) / max(a1, a2)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HUNGARIAN TRACKER  — FIX-4: near-net mode
+# ═══════════════════════════════════════════════════════════════
+class KalmanTracker:
+    """
+    Cost = W_IOU*(1-IoU) + W_DIST*dist_norm + W_AREA*(1-area_sim)
+    FIX-4: Khi 2 track gần lưới → tăng DIST_THRESH, giảm W_AREA
+           (2 player cùng size nên area sim không phân biệt được).
+    """
+    W_IOU  = 0.35
+    W_DIST = 0.50
+    W_AREA = 0.15
+
+    def __init__(self, fps: float):
+        self.tracks: list[KalmanTrack] = []
+        self.fps = fps
+        self._tf: PerspectiveTransformer | None = None   # inject từ ngoài
+
+    def set_transformer(self, tf: PerspectiveTransformer):
+        self._tf = tf
+
+    def _near_net_mode(self) -> bool:
+        """True nếu 2 track hiện tại đều confirmed và gần lưới."""
+        confirmed = [t for t in self.tracks if t.is_confirmed]
+        if len(confirmed) < 2 or self._tf is None:
+            return False
+        ys = []
+        for t in confirmed[:2]:
+            fx, fy = t.last_foot
+            _, cy_m = self._tf.to_court(fx, fy)
+            ys.append(cy_m)
+        return abs(ys[0] - ys[1]) < CFG.NEAR_NET_Y_DIFF
+
+    def step_predict(self):
+        for t in self.tracks:
+            t.predict()
+
+    def update(self, detections: list) -> list:
+        if not self.tracks:
+            for det in detections:
+                if len(self.tracks) < CFG.MAX_PLAYERS:
+                    self.tracks.append(
+                        KalmanTrack(det['bbox'], det['foot'], self.fps))
+            self._prune()
+            return [t for t in self.tracks if t.is_confirmed]
+
+        if not detections:
+            for t in self.tracks:
+                t.grace += 1
+            self._prune()
+            return [t for t in self.tracks if t.is_confirmed]
+
+        near_net = self._near_net_mode()
+        dist_thresh = CFG.NEAR_NET_DIST_PX if near_net else CFG.DIST_THRESH_PX
+        # Khi near-net: giảm weight area (2 người size tương đồng)
+        w_iou  = 0.40 if near_net else self.W_IOU
+        w_dist = 0.55 if near_net else self.W_DIST
+        w_area = 0.05 if near_net else self.W_AREA
+
+        n_t = len(self.tracks)
+        n_d = len(detections)
+        cost = np.ones((n_t, n_d), dtype=np.float64)
+
+        for ti, track in enumerate(self.tracks):
+            for di, det in enumerate(detections):
+                iou    = _iou(track.last_bbox, det['bbox'])
+                dist   = _center_dist(track, det)
+                dist_n = min(dist / dist_thresh, 1.0)
+                area_s = _area_sim(track, det)
+                cost[ti, di] = (w_iou  * (1 - iou)
+                               + w_dist * dist_n
+                               + w_area * (1 - area_s))
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        matched_t = set(); matched_d = set()
+
+        for ti, di in zip(row_ind, col_ind):
+            iou  = _iou(self.tracks[ti].last_bbox, detections[di]['bbox'])
+            dist = _center_dist(self.tracks[ti], detections[di])
+            if iou >= CFG.IOU_THRESH or dist <= dist_thresh:
+                self.tracks[ti].update(detections[di]['bbox'],
+                                       detections[di]['foot'])
+                matched_t.add(ti)
+                matched_d.add(di)
+
+        for ti, track in enumerate(self.tracks):
+            if ti not in matched_t:
+                track.grace += 1
+
+        self._prune()
+
+        for di, det in enumerate(detections):
+            if di not in matched_d and len(self.tracks) < CFG.MAX_PLAYERS:
+                self.tracks.append(
+                    KalmanTrack(det['bbox'], det['foot'], self.fps))
+
+        return [t for t in self.tracks if t.is_confirmed]
+
+    def _prune(self):
+        self.tracks = [
+            t for t in self.tracks
+            if t.lost <= CFG.MAX_LOST_FRAMES and t.grace <= CFG.GRACE_FRAMES
+        ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# DETECTOR  — FIX-1 + FIX-2
+# FIX-1: Dùng lại ROI mask (margin lớn) vào fg mask
+# FIX-2: Court-space filter sau detect
+# ═══════════════════════════════════════════════════════════════
+class PlayerDetector:
+    def __init__(self):
+        self.bg_sub = cv2.createBackgroundSubtractorMOG2(
+            history=CFG.BG_HISTORY,
+            varThreshold=CFG.VAR_THRESHOLD,
+            detectShadows=True)
+        self.learn_rate = CFG.LEARN_RATE
+        self.k_open   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.k_close  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        self.k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        self.roi_mask: np.ndarray | None = None
+        self._tf: PerspectiveTransformer | None = None
+
+    def set_roi(self, roi_mask: np.ndarray):
+        self.roi_mask = roi_mask
+
+    def set_transformer(self, tf: PerspectiveTransformer):
+        self._tf = tf
+
+    def _mog2_mask(self, frame):
+        fg = self.bg_sub.apply(frame, learningRate=self.learn_rate)
+        _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+        # FIX-1: áp ROI mask (margin lớn 200px) — loại trọng tài ngoài sân
+        if self.roi_mask is not None:
+            fg = cv2.bitwise_and(fg, self.roi_mask)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  self.k_open)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self.k_close)
+        fg = cv2.dilate(fg, self.k_dilate, iterations=2)
+        return fg
+
+    def _in_court(self, foot) -> bool:
+        """FIX-2: kiểm tra foot point có trong sân không (court space)."""
+        if self._tf is None:
+            return True   # nếu chưa set transformer thì không lọc
+        cx, cy = self._tf.to_court(foot[0], foot[1])
+        return self._tf.in_court(cx, cy, margin=CFG.COURT_FILTER_MARGIN)
+
+    def _parse(self, cnt, min_a, max_a, min_asp, max_asp):
+        area = cv2.contourArea(cnt)
+        if not (min_a <= area <= max_a):
+            return None
+        x, y, w, h = cv2.boundingRect(cnt)
+        asp = h / max(w, 1)
+        if not (min_asp <= asp <= max_asp):
+            return None
+        cx, cy = x + w//2, y + h//2
+        return {'bbox': (x,y,w,h), 'center': (cx,cy),
+                'foot': (cx, y+h), 'area': area}
+
+    def _nms(self, detections, overlap_thresh=0.4):
+        if not detections:
+            return []
+        dets = sorted(detections, key=lambda d: d['area'], reverse=True)
+        keep = []
+        for d in dets:
+            if not any(_iou(d['bbox'], k['bbox']) > overlap_thresh for k in keep):
+                keep.append(d)
+        return keep
+
+    def detect(self, frame):
+        fg = self._mog2_mask(frame)
+        cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+        raw = []
+        for cnt in cnts:
+            # Pass 1: player bình thường
+            p = self._parse(cnt, CFG.MIN_AREA, CFG.MAX_AREA,
+                            CFG.MIN_ASPECT, CFG.MAX_ASPECT)
+            if p:
+                raw.append(p); continue
+
+            # Pass 2: player nhỏ (xa camera) — MIN_AREA giảm
+            p = self._parse(cnt, max(200, CFG.MIN_AREA//4),
+                            CFG.MIN_AREA, 0.5, CFG.MAX_ASPECT)
+            if p:
+                raw.append(p); continue
+
+            # Pass 3: blob 2 người che nhau → tách đôi
+            area = cv2.contourArea(cnt)
+            if CFG.MAX_AREA < area < CFG.MAX_AREA * 3:
+                x, y, w, h = cv2.boundingRect(cnt)
+                h2 = h // 2
+                for sub_y in (y, y + h2):
+                    sub_h = min(h2, frame.shape[0] - sub_y)
+                    if sub_h < 10:
+                        continue
+                    sub_a = w * sub_h
+                    if CFG.MIN_AREA // 2 <= sub_a <= CFG.MAX_AREA:
+                        cx = x + w//2
+                        raw.append({'bbox': (x, sub_y, w, sub_h),
+                                    'center': (cx, sub_y + sub_h//2),
+                                    'foot':   (cx, sub_y + sub_h),
+                                    'area':   sub_a})
+
+        # FIX-2: lọc theo court space — loại detection ngoài sân
+        raw = [d for d in raw if self._in_court(d['foot'])]
+
+        result = self._nms(raw)[:CFG.MAX_PLAYERS + 1]
+        return fg, result
+
+
+# ═══════════════════════════════════════════════════════════════
+# FIX-3: STABLE PLAYER ASSIGNER — cứng, không bao giờ 2 track cùng slot
+# ═══════════════════════════════════════════════════════════════
+class PlayerAssigner:
+    """
+    - track_id → slot cố định suốt vòng đời (sticky).
+    - Khi 2 track bị assign cùng slot (conflict): giữ track có hits cao hơn,
+      re-assign track kia vào slot còn lại.
+    - Slot được giải phóng khi tracker xóa track.
+    """
+    COURT_MID = CFG.COURT_H_M / 2
+
+    def __init__(self):
+        self._tid_to_slot: dict[int, int] = {}
+        self._slot_owner: dict[int, int | None] = {0: None, 1: None}
+
+    def assign(self, tracks: list,
+               tf: PerspectiveTransformer) -> dict[int, int]:
+        if not tracks:
+            return {}
+
+        active_ids = {t.id for t in tracks}
+
+        # Giải phóng slot track đã chết
+        for slot in (0, 1):
+            owner = self._slot_owner[slot]
+            if owner is not None and owner not in active_ids:
+                if owner in self._tid_to_slot:
+                    del self._tid_to_slot[owner]
+                self._slot_owner[slot] = None
+
+        # Gán slot cho track mới
+        for t in tracks:
+            if t.id not in self._tid_to_slot:
+                fx, fy = t.last_foot
+                _, cy_m = tf.to_court(fx, fy)
+                slot = self._pick_slot(cy_m)
+                self._tid_to_slot[t.id] = slot
+                self._slot_owner[slot]   = t.id
+
+        # FIX-3: kiểm tra conflict — không để 2 track cùng slot
+        slot_to_tracks: dict[int, list] = {0: [], 1: []}
+        for t in tracks:
+            if t.id in self._tid_to_slot:
+                slot_to_tracks[self._tid_to_slot[t.id]].append(t)
+
+        for slot, slot_tracks in slot_to_tracks.items():
+            if len(slot_tracks) > 1:
+                # Giữ track có hits cao nhất
+                slot_tracks.sort(key=lambda t: t.hits, reverse=True)
+                winner = slot_tracks[0]
+                self._slot_owner[slot] = winner.id
+                other_slot = 1 - slot
+                # Re-assign các track còn lại
+                for loser in slot_tracks[1:]:
+                    if self._slot_owner[other_slot] is None:
+                        self._tid_to_slot[loser.id] = other_slot
+                        self._slot_owner[other_slot] = loser.id
+                    else:
+                        # Cả 2 slot bận: giữ nguyên winner, loser dùng slot kia tạm
+                        self._tid_to_slot[loser.id] = other_slot
+
+        result = {}
+        for t in tracks:
+            if t.id in self._tid_to_slot:
+                result[t.id] = self._tid_to_slot[t.id]
+        return result
+
+    def _pick_slot(self, cy_m: float) -> int:
+        preferred = 0 if cy_m < self.COURT_MID else 1
+        other     = 1 - preferred
+        if self._slot_owner[preferred] is None:
+            return preferred
+        if self._slot_owner[other] is None:
+            return other
+        return preferred
+
+
+# ═══════════════════════════════════════════════════════════════
+# HEATMAP
+# ═══════════════════════════════════════════════════════════════
+class HeatmapGenerator:
+    def __init__(self, fps: float):
+        W = int(CFG.COURT_W_M * CFG.HEATMAP_RES_M)
+        H = int(CFG.COURT_H_M * CFG.HEATMAP_RES_M)
+        self.shape = (H, W)
+        self.grids = {
+            'all': np.zeros((H,W), np.float64),
+            0:     np.zeros((H,W), np.float64),
+            1:     np.zeros((H,W), np.float64),
+        }
+        self.time_weight = CFG.SKIP_FRAMES / fps
+
+    def add(self, slot: int, cx_m: float, cy_m: float):
+        px = int(np.clip(cx_m * CFG.HEATMAP_RES_M, 0, self.shape[1]-1))
+        py = int(np.clip(cy_m * CFG.HEATMAP_RES_M, 0, self.shape[0]-1))
+        w  = self.time_weight
+        self.grids[slot][py, px]  += w
+        self.grids['all'][py, px] += w
+
+    def total_seconds(self, key='all') -> float:
+        return float(self.grids[key].sum())
+
+    def render(self, key='all', cmap='jet', title='Heatmap', path='heatmap.png'):
+        g = gaussian_filter(self.grids[key].copy().astype(np.float32),
+                            sigma=CFG.GAUSSIAN_SIGMA)
+        if g.max() == 0:
+            print(f"[WARN] Grid '{key}' trống"); return None
+        g /= g.max()
+
+        fig, ax = plt.subplots(figsize=(5, 10))
+        im = ax.imshow(g, origin='upper',
+                       extent=[0, CFG.COURT_W_M, CFG.COURT_H_M, 0],
+                       cmap=cmap, vmin=0, vmax=1, aspect='equal')
+        self._lines(ax)
+        total = self.total_seconds(key)
+        ax.set_title(f"{title}\n(~{total:.0f}s dữ liệu)",
+                     fontsize=12, fontweight='bold')
+        ax.set_xlabel('Width (m)'); ax.set_ylabel('Length (m)')
+        plt.colorbar(im, ax=ax, label='Thời gian hoạt động (chuẩn hoá)')
+        plt.tight_layout()
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"[INFO] Heatmap -> {path}  ({total:.1f}s)")
+        return path
+
+    @staticmethod
+    def _lines(ax):
+        W, H = CFG.COURT_W_M, CFG.COURT_H_M; c = 'white'
+        ax.plot([0,W,W,0,0], [0,0,H,H,0], color=c, lw=1.5)
+        ax.axhline(H/2, color=c, lw=1.5)
+        for y in (H/2-1.98, H/2+1.98): ax.axhline(y, color=c, lw=0.9, ls='--', alpha=0.8)
+        for y in (0.76, H-0.76):        ax.axhline(y, color=c, lw=0.7, ls=':', alpha=0.7)
+        ax.axvline(W/2, color=c, lw=0.8, ls='--', alpha=0.6)
+        for x in (0.46, W-0.46):        ax.axvline(x, color=c, lw=0.7, ls=':', alpha=0.5)
+
+
+# ═══════════════════════════════════════════════════════════════
+# DEBUG GRID
+# ═══════════════════════════════════════════════════════════════
+def draw_debug_grid(frame, tf: PerspectiveTransformer, n=6):
+    W, H = CFG.COURT_W_M, CFG.COURT_H_M
+    vis  = frame.copy()
+    for i in range(n+1):
+        pts = [tf.to_image(W*j/20, H*i/n) for j in range(21)]
+        cv2.polylines(vis, [np.int32(pts)], False, (0,255,150), 1, cv2.LINE_AA)
+    for j in range(n+1):
+        pts = [tf.to_image(W*j/n, H*i/20) for i in range(21)]
+        cv2.polylines(vis, [np.int32(pts)], False, (0,255,150), 1, cv2.LINE_AA)
+    return vis
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+SLOT_COLORS = {0: (255, 80, 30), 1: (30, 120, 255)}
+
+
+def run(video_path: str = CFG.VIDEO_PATH,
+        output_dir: str = CFG.OUTPUT_DIR):
+
+    os.makedirs(output_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Không mở được: {video_path}")
+
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    max_fr = int(CFG.MAX_DURATION_SEC * fps)
+    print(f"[INFO] {src_w}x{src_h} @ {fps:.1f}fps  max={CFG.MAX_DURATION_SEC}s")
+
+    corners = load_or_select_corners(video_path, frame_index=30)
+    tf      = PerspectiveTransformer(corners)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    _, sample = cap.read()
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # FIX-1: ROI margin lớn hơn (200px)
+    roi_mask = build_roi_mask(sample.shape, corners, margin=CFG.ROI_MARGIN_PX)
+
+    detector = PlayerDetector()
+    detector.set_roi(roi_mask)          # FIX-1: áp vào fg mask
+    detector.set_transformer(tf)        # FIX-2: court-space filter
+
+    tracker  = KalmanTracker(fps)
+    tracker.set_transformer(tf)         # FIX-4: near-net mode
+
+    assigner = PlayerAssigner()
+    heatmap  = HeatmapGenerator(fps)
+
+    vid_path = os.path.join(output_dir, "annotated_output.mp4")
+    csv_path = os.path.join(output_dir, "positions.csv")
+    fourcc   = cv2.VideoWriter_fourcc(*'mp4v')
+    vwriter  = cv2.VideoWriter(vid_path, fourcc, fps, (src_w, src_h))
+
+    csv_rows  = []
+    frame_idx = 0
+    print("[INFO] Bắt đầu xử lý...\n")
+
+    while frame_idx < max_fr:
+        ret, frame = cap.read()
+        if not ret: break
+
+        t_sec = frame_idx / fps
+        tracker.step_predict()
+
+        if frame_idx % CFG.SKIP_FRAMES == 0:
+            fg, dets = detector.detect(frame)
+            tracks   = tracker.update(dets)
+            slot_map = assigner.assign(tracks, tf)
+
+            vis = frame.copy()
+            if CFG.DRAW_GRID and frame_idx < 300:
+                vis = draw_debug_grid(vis, tf)
+
+            cv2.polylines(vis, [corners.astype(np.int32)], True, (0,220,220), 2)
+
+            mid_pts = [tf.to_image(CFG.COURT_W_M*j/20, CFG.COURT_H_M/2)
+                       for j in range(21)]
+            cv2.polylines(vis, [np.int32(mid_pts)], False, (0,255,0), 1)
+
+            # FIX-4: hiển thị near-net warning
+            near_net = tracker._near_net_mode()
+            if near_net:
+                cv2.putText(vis, "NEAR-NET MODE", (10, 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            for track in tracks:
+                slot = slot_map.get(track.id, -1)
+                col  = SLOT_COLORS.get(slot, (200,200,200))
+                x,y,w,h = track.last_bbox
+                fx,fy   = track.last_foot
+                cx_m,cy_m = tf.to_court(fx, fy)
+
+                cv2.rectangle(vis, (x,y), (x+w,y+h), col, 2)
+                cv2.circle(vis, (int(fx),int(fy)), 7, (0,255,255), -1)
+
+                if slot >= 0 and tf.in_court(cx_m, cy_m):
+                    heatmap.add(slot, cx_m, cy_m)
+                    csv_rows.append({
+                        'frame'     : frame_idx,
+                        'time_sec'  : round(t_sec, 3),
+                        'slot_id'   : slot,
+                        'track_id'  : track.id,
+                        'img_foot_x': round(fx, 1),
+                        'img_foot_y': round(fy, 1),
+                        'court_x_m' : round(cx_m, 3),
+                        'court_y_m' : round(cy_m, 3),
+                    })
+
+                side_lbl = "TOP" if slot == 0 else "BOT"
+                label = (f"[{side_lbl}] id={track.id} "
+                         f"({cx_m:.1f},{cy_m:.1f})m L={track.lost}")
+                cv2.putText(vis, label, (x, y-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
+
+            hud = f"t={t_sec:.1f}s | tracks={len(tracks)} | det={len(dets)}"
+            cv2.putText(vis, hud, (10,28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
+            vwriter.write(vis)
+        else:
+            vwriter.write(frame)
+
+        frame_idx += 1
+        if frame_idx % int(fps*10) == 0:
+            active = len([t for t in tracker.tracks if t.is_confirmed])
+            print(f"  t={t_sec:.0f}s | active={active} | rows={len(csv_rows)}")
+
+    cap.release(); vwriter.release()
+    print(f"\n[INFO] Xong {frame_idx} frames")
+
+    if csv_rows:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            wr = csv.DictWriter(f, fieldnames=csv_rows[0].keys())
+            wr.writeheader(); wr.writerows(csv_rows)
+        print(f"[INFO] CSV -> {csv_path}  ({len(csv_rows)} rows)")
+    else:
+        print("[WARN] Không có dữ liệu CSV")
+
+    heatmap.render('all', 'jet', 'Tất cả VĐV – Activity Heatmap',
+                   os.path.join(output_dir, 'heatmap_all.png'))
+    for slot, cmap, title in [(0,'hot','Player Nửa Trên (Slot 0)'),
+                               (1,'cool','Player Nửa Dưới (Slot 1)')]:
+        if heatmap.grids[slot].max() > 0:
+            heatmap.render(slot, cmap, title,
+                           os.path.join(output_dir, f'heatmap_slot{slot}.png'))
+
+    print(f"\n[DONE] Output: {output_dir}/")
+    return {'video': vid_path, 'csv': csv_path}
+
+
+if __name__ == "__main__":
+    run(CFG.VIDEO_PATH)
